@@ -1,0 +1,7 @@
+# Data Folders
+output
+output_dino_1
+wandb
+
+# Cache
+__pycache__
