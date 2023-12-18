@@ -1,16 +1,3 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# 
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-# 
-#     http://www.apache.org/licenses/LICENSE-2.0
-# 
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import argparse
 import os
 import sys
@@ -32,7 +19,7 @@ from torchvision import models as torchvision_models
 
 import utils
 import vision_transformer as vits
-from vision_transformer import ATALHead
+from vision_transformer import ATALHead, ATALHeadClassify
 
 import wandb
 import ipdb
@@ -40,6 +27,7 @@ import ipdb
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(torchvision_models.__dict__[name]))
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
@@ -122,7 +110,7 @@ def get_args_parser():
     # Misc
     parser.add_argument('--data_path', default='/home/rushil/data/clear-10-train/labeled_images/1', type=str, 
                         help='Please specify path to the ImageNet training data.')
-    parser.add_argument('--output_dir', default="/home/rushil/atal/output_dino_1", type=str, 
+    parser.add_argument('--output_dir', default="/home/rushil/ATAL/outputs/output_dino", type=str, 
                         help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
@@ -184,7 +172,7 @@ def train_dino(args):
         print(f"Unknow architecture: {args.arch}")
 
     # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(student, ATALHead(
+    student = utils.MultiCropWrapper(student, ATALHeadClassify(
         embed_dim,
         args.out_dim,
         use_bn=args.use_bn_in_head,
@@ -192,7 +180,7 @@ def train_dino(args):
     ))
     teacher = utils.MultiCropWrapper(
         teacher,
-        ATALHead(embed_dim, args.out_dim, args.use_bn_in_head),
+        ATALHeadClassify(embed_dim, args.out_dim, args.use_bn_in_head),
     )
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
@@ -202,12 +190,12 @@ def train_dino(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], find_unused_parameters=True)
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], find_unused_parameters=True)
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
@@ -258,16 +246,13 @@ def train_dino(args):
     # ============ optionally resume training ... ============
 
     wandb.init(
-        # set the wandb project where this run will be logged
-        project="dino",
-        
-        # track hyperparameters and run metadata
+        project="DINO",
         config={
         "learning_rate": lr_schedule,
         "weight_decay": wd_schedule,
         "architecture": "DINO",
         "dataset": "CLEAR-10",
-        "epochs": 100,
+        "epochs": args.epochs,
         }
     )
 
@@ -325,12 +310,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
 
-    student_label = ''
-    teacher_label = ''
-    acc_count = 0
-    iteration_count = 0
-
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, (images, target) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -342,9 +322,12 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
+            student_output, student_loss, student_count, student_pred = student(images, target)
+            teacher_output, teacher_loss, teacher_count, teacher_pred = teacher(images[:2], target)
             loss = dino_loss(student_output, teacher_output, epoch)
+
+            student_count = (student_count / args.batch_size_per_gpu) * 100
+            teacher_count = (teacher_count / args.batch_size_per_gpu) * 100
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -375,25 +358,24 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             m = momentum_schedule[it]  # momentum parameter
             for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
-
-        with torch.no_grad():
-            student_result = student_output.detach()
-            teacher_result = teacher_output.detach()
-            student_label = ''
-            teacher_label = ''
-            if student_label == teacher:
-                acc_count = acc_count + 1
-            iteration_count = iteration_count + 1
-            accuracy = float(acc_count / iteration_count)
+            
+        # student_acc1, student_acc5 = utils.accuracy(student_pred, target.float(), topk=(1,5))
+        # teacher_acc1, teacher_acc5 = utils.accuracy(teacher_pred, target.float(), topk=(1,5))
 
         # logging
         torch.cuda.synchronize()
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
-        metric_logger.update(acc=accuracy)
-        print(f'Student Label: [{student_label}] Teacher Label: [{teacher_label}]')
-        wandb.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "wd": optimizer.param_groups[0]["weight_decay"], "acc": accuracy})
+        metric_logger.update(s_loss=student_loss)
+        metric_logger.update(t_loss=teacher_loss)
+        metric_logger.update(s_count=student_count)
+        metric_logger.update(t_count=teacher_count)
+        wandb.log({"total_loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], 
+                   "wd": optimizer.param_groups[0]["weight_decay"], "s_loss": student_loss.item(), 
+                   "t_loss": teacher_loss.item(), "s_count": student_count, "t_count": teacher_count})
+
+    # "s_acc1": student_acc1, "s_acc5": student_acc5, "t_acc1": teacher_acc1, "t_acc5": teacher_acc5
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

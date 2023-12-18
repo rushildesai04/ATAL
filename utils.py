@@ -17,6 +17,7 @@ Misc functions.
 Mostly copy-paste from torchvision references or other public repos like DETR:
 https://github.com/facebookresearch/detr/blob/master/util/misc.py
 """
+import argparse
 import os
 import sys
 import time
@@ -25,12 +26,15 @@ import random
 import datetime
 import subprocess
 from collections import defaultdict, deque
+import warnings
 
 import numpy as np
 import torch
 from torch import nn
 import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
+
+import ipdb
 
 
 class GaussianBlur(object):
@@ -607,7 +611,7 @@ class MultiCropWrapper(nn.Module):
         self.backbone = backbone
         self.head = head
 
-    def forward(self, x):
+    def forward(self, x, t):
         # convert to list
         if not isinstance(x, list):
             x = [x]
@@ -626,7 +630,7 @@ class MultiCropWrapper(nn.Module):
             output = torch.cat((output, _out))
             start_idx = end_idx
         # Run the head forward on the concatenated features.
-        return self.head(output)
+        return self.head(output, t)
 
 
 def get_params_groups(model):

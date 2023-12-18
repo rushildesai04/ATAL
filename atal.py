@@ -35,7 +35,8 @@ import vision_transformer as vits
 import kckl
 from vision_transformer import ATALHead
 
-# import ipdb
+import wandb
+import ipdb
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -90,10 +91,10 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
-    parser.add_argument('--epochs', default=10, type=int, help='Number of epochs of training.')
+    parser.add_argument('--epochs', default=20, type=int, help='Number of epochs of training.')
     parser.add_argument('--image_iterations', default=10, type=int, help="""Number of times image 
         should be trained on in an epoch.""")
-    parser.add_argument("--warmup_epochs", default=2, type=int,
+    parser.add_argument("--warmup_epochs", default=5, type=int,
         help="Number of epochs for the linear learning-rate warm up.")
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
@@ -124,7 +125,7 @@ def get_args_parser():
     # Misc
     parser.add_argument('--data_path', default="/home/rushil/data/clear-10-train/labeled_images/1", type=str, 
         help='Path to save logs and checkpoints.')
-    parser.add_argument('--output_dir', default="/home/rushil/atal/output", type=str, 
+    parser.add_argument('--output_dir', default="/home/rushil/ATAL/outputs/output_atal", type=str, 
         help='Path to the dataset.')
     parser.add_argument('--epoch_print_freq', default=10, type=int, help="""Print epoch stats 
         at every interval.""")
@@ -197,14 +198,14 @@ def TrainATAL(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=device_ids)
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=device_ids, find_unused_parameters=True)
         teacher_without_ddp = teacher.module
 
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
 
-    student = nn.parallel.DistributedDataParallel(student, device_ids=device_ids)
+    student = nn.parallel.DistributedDataParallel(student, device_ids=device_ids, find_unused_parameters=True)
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
 
@@ -216,7 +217,7 @@ def TrainATAL(args):
 
     # ============ building KCKL classifier ... ============
 
-    classifier = kckl.KCKL()
+    classifier = kckl.KCKL(data_path=args.data_path, embed_dim=args.out_dim, gpu=args.gpu)
     classifier.build_network()
 
     # ============ preparing loss ... ============
@@ -267,9 +268,21 @@ def TrainATAL(args):
 
     print(f"Loss, Optimizer and Schedulers are ready.")
 
+    wandb.init(
+        project="ATAL",
+        config={
+        "learning_rate": lr_schedule,
+        "weight_decay": wd_schedule,
+        "momentum": momentum_schedule,
+        "architecture": "ATAL",
+        "dataset": "CLEAR-10",
+        "epochs": args.epochs,
+        }
+    )
+
     # ============ optionally resume training ... ============
 
-    to_restore = {"epoch": 0, "iterations": 0}
+    to_restore = {"epoch": 0, "correct_count": 0, "iterations": 0}
 
     utils.restart_from_checkpoint(
         os.path.join(args.output_dir, "atal_ckpt.pth"),
@@ -282,6 +295,7 @@ def TrainATAL(args):
     )
 
     start_epoch = to_restore["epoch"]
+    correct_count = to_restore["correct_count"]
     iterations = to_restore["iterations"]
 
     start_time = time.time()
@@ -293,9 +307,9 @@ def TrainATAL(args):
 
         # ============ training one epoch of ATAL ... ============
 
-        train_stats = OneEpochATAL(student, teacher, teacher_without_ddp, classifier, atal_loss,
+        train_stats, train_corr, train_it = OneEpochATAL(student, teacher, teacher_without_ddp, classifier, atal_loss,
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule, iteration_schedule,
-            epoch, fp16_scaler, args)
+            epoch, fp16_scaler, args, correct_count, iterations)
 
         # ============ writing logs ... ============
 
@@ -304,13 +318,17 @@ def TrainATAL(args):
             'teacher': teacher.state_dict(),
             'optimizer': optimizer.state_dict(),
             'epoch': epoch + 1,
-            'iterations': iterations + (len(data_loader) * iteration_schedule(epoch)),
+            "correct_count": train_corr,
+            'iterations': train_it,
             'atal_loss': atal_loss.state_dict(),
             'args': args,
         }
 
         if fp16_scaler is not None:
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
+
+        correct_count = train_corr
+        iterations = train_it
 
         utils.save_on_master(save_dict, os.path.join(args.output_dir, 'atal_ckpt.pth'))
 
@@ -325,25 +343,29 @@ def TrainATAL(args):
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(f'(ATAL) Epoch: [{epoch + 1}/{args.epochs}] Time: [{current_datetime}] --> ' 
                         + json.dumps(log_stats) + "\n")
-        
-        iterations = iterations + (len(data_loader) * iteration_schedule(epoch))
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
 
     print('Training time {}'.format(total_time_str))
+    wandb.finish()
 
 
 def OneEpochATAL(student, teacher, teacher_without_ddp, classifier, atal_loss, data_loader, optimizer, lr_schedule, 
-                    wd_schedule, momentum_schedule, iteration_schedule, epoch, fp16_scaler, args):
+                    wd_schedule, momentum_schedule, iteration_schedule, epoch, fp16_scaler, args, corr, it):
 
     iteration_range = iteration_schedule(epoch)
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = f'Epoch: [{epoch + 1}/{args.epochs}]'
+    args.epoch_print_freq = len(data_loader)-1
+
+    acc_count = 0
+    corr_count = corr
+    it_count = it
     
     for batch, (image, target) in enumerate(metric_logger.log_every(data_loader, args.epoch_print_freq, header)):
 
-        for iteration in range(iteration_range):
+        for _ in range(iteration_range):
 
             # global training iteration
             it = (len(data_loader) * epoch) + batch
@@ -398,26 +420,32 @@ def OneEpochATAL(student, teacher, teacher_without_ddp, classifier, atal_loss, d
                 m = momentum_schedule[it]  # momentum parameter
                 for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
                     param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
-            
-            # class_params, class_pred, class_tar, class_pred_cache, class_tar_cache = classifier.eval_network(image, target)
-            # classification_dict = {
-            #     'params': class_params,
-            #     'prediction': class_pred,
-            #     'target': class_tar,
-            #     'prediction_label': class_pred_cache,
-            #     'target_label': class_tar_cache,
-            # }
 
-            # if iteration == iteration_range - 1:
-            #     print(f'Image Classification Results: {str(classification_dict.params)}')
-            #     print(f'Prediction: {classification_dict.prediction_label} Target: {classification_dict.target_label}')
-            #     print(f'Raw Prediction: {classification_dict.prediction} Raw Target: {classification_dict.target}')
+            classification_image = student_output.detach()
+            classification_target = target.detach()
+            
+            _, class_pred, class_tar, class_pred_cache, class_tar_cache = classifier.eval_network(
+                classification_image, classification_target)
+            
+            acc1, acc3 = utils.accuracy(class_pred, class_tar, topk=(1, 3))
+
+            if class_pred_cache[0] == class_tar_cache[0]:
+                acc_count = acc_count + 1
+                corr_count = corr_count + 1
+            it_count = it_count + 1
+            main_acc = float(corr_count / it_count) * 100
 
             # logging
             torch.cuda.synchronize()
             metric_logger.update(loss=loss.item())
             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+            metric_logger.update(acc=main_acc)
+            metric_logger.meters['acc1'].update(acc1.item(), n=iteration_range)
+            metric_logger.meters['acc3'].update(acc3.item(), n=iteration_range)
+            metric_logger.update(corr=acc_count)
             metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
+            wandb.log({"acc_local": main_acc, "acc1_local": acc1.item(), "acc3_local": acc3.item(), 
+                       "corr": corr_count, "it": it_count})
 
         # gather the stats from the batch
         metric_logger.synchronize_between_processes()
@@ -427,10 +455,14 @@ def OneEpochATAL(student, teacher, teacher_without_ddp, classifier, atal_loss, d
             print(f'Stopping Epoch [{epoch + 1}/{args.epochs}] ATAL training because loss has reached a sufficient value')
             break
 
+        wandb.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "wd": optimizer.param_groups[0]["weight_decay"], 
+                   "acc_general": main_acc, "acc1_general": acc1.item(), "acc3_general": acc3.item()})
+
+
     # gather the stats from all batches
     metric_logger.synchronize_between_processes()
     print(f'Epoch [{epoch + 1}/{args.epochs}] Stats:', metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, corr_count, it_count
 
 
 class LossATAL(nn.Module):

@@ -34,14 +34,15 @@ import atal
 import utils
 import vision_transformer as vits
 
+import ipdb
 
 class KCKL():
 
     def __init__(self, arch='vit_small', data_path='/home/rushil/data/clear-10-train/labeled_images/1',
-                 output_dir='/home/rushil/atal/output', checkpoint_key='kckl', pretrained_weights='', 
+                 output_dir='/home/rushil/ATAL/outputs/output_kckl', checkpoint_key='kckl', pretrained_weights='', 
                  dist_url='env://', num_workers=16, batch_size_per_gpu=1, lr=0.00001, min_kckl_loss=0.001, patch_size=16, 
-                 n_last_blocks=6, warmup_epochs=5, concat_dim=True, raw_input=False, saveckpt_freq=20, 
-                 print_freq=10, seed=0):
+                 n_last_blocks=1, warmup_epochs=5, embed_dim=65536, concat_dim=True, saveckpt_freq=20, 
+                 print_freq=10, seed=0, gpu=None):
         
         # class parameters
         self.arch = arch
@@ -57,18 +58,19 @@ class KCKL():
         self.patch_size = patch_size
         self.n_last_blocks = n_last_blocks
         self.warmup_epochs = warmup_epochs
+        self.embed_dim = embed_dim
         self.concat_dim = concat_dim
-        self.raw_input = raw_input
         self.saveckpt_freq = saveckpt_freq
         self.print_freq = print_freq
         self.seed = seed
+        self.gpu = gpu
         self.input_dim = None
         self.linear_input_dim = None
-        self.raw_input_dim = None
         self.num_labels = None
         self.data_classes = None
         self.model = None
         self.classifier = None
+        self.head = None
         self.loss = None
         self.optimizer = None
 
@@ -87,7 +89,6 @@ class KCKL():
         parser.add_argument('--n_last_blocks', default=self.n_last_blocks, type=int)
         parser.add_argument('--warmup_epochs', default=self.warmup_epochs, type=int)
         parser.add_argument('--concat_dim', default=self.concat_dim, type=bool)
-        parser.add_argument('--raw_input', default=self.raw_input, type=bool)
         parser.add_argument('--saveckpt_freq', default=self.saveckpt_freq, type=int)
         parser.add_argument('--print_freq', default=self.print_freq, type=int)
         parser.add_argument("--local_rank", default=0, type=int)        
@@ -116,6 +117,8 @@ class KCKL():
         model.eval()
         self.model = model
 
+        self.head = KCKLHead(self.model.embed_dim, self.embed_dim, use_bn=False, norm_last_layer = False)
+
         # Load weights to evaluate
         utils.load_pretrained_weights(model, self.pretrained_weights, self.checkpoint_key, self.arch, self.patch_size)
         print(f"Model {self.arch} built.")
@@ -130,41 +133,34 @@ class KCKL():
 
         # Establish input dimension
         if self.arch == 'vit_tiny':
-            self.input_dim = 34592
-            self.linear_input_dim = 1152
-            self.raw_input_dim = 197136
+            self.input_dim = 16250944
+            self.linear_input_dim = self.embed_dim
         elif self.arch == 'vit_small':
-            self.input_dim = 70688
-            self.linear_input_dim = 2304
-            self.raw_input_dim = 197136
+            self.input_dim = 16250944
+            self.linear_input_dim = self.embed_dim
         elif self.arch == 'vit_base':
-            self.input_dim = 142880
-            self.linear_input_dim = 4608
-            self.raw_input_dim = 197136
+            self.input_dim = 16250944
+            self.linear_input_dim = self.embed_dim
         elif self.arch == 'vit_large':
-            self.input_dim = 287264
-            self.linear_input_dim = 9216
-            self.raw_input_dim = 197136
+            self.input_dim = 16250944
+            self.linear_input_dim = self.embed_dim
         else:
             self.input_dim = 0
             self.linear_input_dim = 0
-            self.raw_input_dim = 0
 
         # Make Network
-        if self.raw_input and self.concat_dim:
-            print(f"Error: Choose to either use raw image tensor or concatenate intermeadiate tensor dimensions for KCKL input.")
-            sys.exit(1)
-        elif self.raw_input:
-            self.classifier = Network4D(self.raw_input_dim, self.num_labels)
-        elif self.concat_dim:
+        if self.concat_dim:
             self.classifier = Network2D(self.linear_input_dim, self.num_labels)
         else:
             self.classifier = Network3D(self.input_dim, self.num_labels)
 
         self.classifier = self.classifier.cuda()
 
-        device_ids=[os.environ.get('CUDA_VISIBLE_DEVICES')]
-        device_ids = ['cuda:' + id for id in device_ids]
+        if self.gpu == None:
+            device_ids=[os.environ.get('CUDA_VISIBLE_DEVICES')]
+            device_ids = ['cuda:' + id for id in device_ids]
+        else:
+            device_ids = [self.gpu]
 
         self.classifier = nn.parallel.DistributedDataParallel(self.classifier, device_ids=device_ids)
 
@@ -180,7 +176,7 @@ class KCKL():
         # Transform images to tensors
         train_transform = transforms.Compose([
             transforms.Resize(256, interpolation=3),
-            transforms.CenterCrop(224),
+            transforms.CenterCrop(256),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
@@ -214,8 +210,8 @@ class KCKL():
             train_loader.sampler.set_epoch(epoch)
 
             # run one training epoch on model
-            train_stats = train(self.model, self.classifier, self.optimizer, train_loader, epoch, self.min_kckl_loss, 
-                self.n_last_blocks, self.warmup_epochs, self.concat_dim, self.raw_input, self.print_freq)
+            train_stats = train(self.model, self.head, self.classifier, self.optimizer, train_loader, epoch, self.min_kckl_loss, 
+                self.n_last_blocks, self.warmup_epochs, self.concat_dim, self.print_freq)
 
             # create save info for model
             save_dict = {"epoch": epoch + 1, "state_dict": self.classifier.state_dict(), 
@@ -243,10 +239,10 @@ class KCKL():
     
     def eval_network(self, image, target):
         return validate(self.model, self.classifier, self.optimizer, image, target, self.num_workers, self.batch_size_per_gpu, 
-                        self.n_last_blocks, self.concat_dim, self.raw_input, self.data_classes, self.print_freq)
+                        self.n_last_blocks, self.concat_dim, self.data_classes, self.print_freq)
 
 
-def train(model, classifier, optimizer, loader, epoch, min_kckl_loss, n, warmup_epochs, concat_dim, raw_input, print_freq):
+def train(model, head, classifier, optimizer, loader, epoch, min_kckl_loss, n, warmup_epochs, concat_dim, print_freq):
 
     # set classifier in train mode
     classifier.train()
@@ -267,16 +263,15 @@ def train(model, classifier, optimizer, loader, epoch, min_kckl_loss, n, warmup_
 
         # forward
         with torch.no_grad():
-            if raw_input:
-                output = inp
-                output = output.repeat(3, 1, 1, 1)
-            else:
-                intermediate_output = model.get_intermediate_layers(inp, n)
 
-                if concat_dim:
-                    output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
-                else:
-                    output = torch.cat([x for x in intermediate_output])
+            intermediate_output = model.get_intermediate_layers(inp, n)
+            intermediate_output = [head(x) for x in intermediate_output]
+
+            if concat_dim:
+                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
+            else:
+                output = torch.cat([x for x in intermediate_output])
+                
 
         # run classifier on output
         output = classifier(output)
@@ -308,8 +303,8 @@ def train(model, classifier, optimizer, loader, epoch, min_kckl_loss, n, warmup_
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-def validate(model, classifier, optimizer, image, target, num_workers, batch_size_per_gpu, n, concat_dim, raw_input, 
-             data_classes, print_freq):
+def validate(model, classifier, optimizer, image, target, num_workers, batch_size_per_gpu, n, concat_dim, data_classes, 
+             print_freq):
 
     # create validation loader
     val_loader = torch.utils.data.DataLoader(image, batch_size=batch_size_per_gpu, num_workers=num_workers, pin_memory=True)
@@ -317,97 +312,136 @@ def validate(model, classifier, optimizer, image, target, num_workers, batch_siz
     # set classifier in eval mode
     classifier.eval()
 
-    # create storage for prediction labels
-
     # set up logger
     metric_logger = utils.MetricLogger(delimiter="  ")
     prediction_cache = []
     target_cache = []
     header = '(KCKL) Testing...'
 
-    # eval loop for input data image
-    for inp in metric_logger.log_every(val_loader, print_freq, header):
+    # move to gpu
+    inp = image.cuda(non_blocking=True)
+    target = target.cuda(non_blocking=True)
 
-        # move to gpu
-        inp = inp.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+    # run classifier on output
+    output = classifier(inp)
+    output = torch.mean(output, dim=0, keepdim=True)
 
-        # forward
-        with torch.no_grad():
-            if raw_input:
-                output = inp
-                output = output.repeat(3, 1, 1, 1)
-            else:
-                intermediate_output = model.get_intermediate_layers(inp, n)
+    # get prediction from classifier output
+    prediction = nn.Softmax(output)
+    prediction = torch.argmax(output).item()
+    prediction = data_classes[prediction]
+    prediction_cache.append(prediction)
 
-                if concat_dim:
-                    output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
-                else:
-                    output = torch.cat([x for x in intermediate_output])
+    # convert target data label to string
+    target_label = data_classes[target.item()]
+    target_cache.append(target_label)
 
-        # run classifier on output
-        output = classifier(output)
+    # compute cross entropy loss
+    loss = nn.CrossEntropyLoss()(output, target)
 
-        # get prediction from classifier output
-        prediction = nn.Softmax(output)
-        prediction = torch.argmax(output).item()
-        prediction = data_classes[prediction]
-        prediction_cache.append(prediction)
+    # compute the gradients
+    optimizer.zero_grad()
+    loss.backward()
 
-        # convert target data label to string
-        target_label = nn.Softmax(target)
-        target_label = torch.argmax(target_label).item()
-        target_label = data_classes[target_label]
-        target_cache.append(target_label)
+    # step
+    optimizer.step()
 
-        # compute cross entropy loss
-        loss = nn.CrossEntropyLoss()(output, target)
-
-        # compute the gradients
-        optimizer.zero_grad()
-        loss.backward()
-
-        # step
-        optimizer.step()
-
-        # calculates top label and top 5 labels if dataset has >= 5 labels
-        if len(data_classes) >= 5:
-
-            acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
-        else:
-            
-            acc1 = utils.accuracy(output, target, topk=(1,))
-
-        # update top label log
-        torch.cuda.synchronize()
-        batch_size = inp.shape[0]
-        metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-
-        # update top 5 labels log if applicable
-        if classifier.module.num_labels >= 5:
-            metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
-            
-    # output eval stats produced by the classifier
+    # calculates top label and top 5 labels if dataset has >= 5 labels
     if len(data_classes) >= 5:
 
-        print('Top 1: [{top1.global_avg:.3f}] Top 5: [{top5.global_avg:.3f}] Loss: [{losses.global_avg:.3f}]'
-        .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
-        print(f'Prediction: {prediction_cache} Target: {target_cache}')
+        acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
     else:
+        
+        acc1 = utils.accuracy(output, target, topk=(1,))
 
-        print('* Top 1: [{top1.global_avg:.3f}] Loss: [{losses.global_avg:.3f}]'
-        .format(top1=metric_logger.acc1, losses=metric_logger.loss))
-        print(f'Prediction: {prediction_cache} Target: {target_cache}')
+    # update top label log
+    torch.cuda.synchronize()
+    batch_size = inp.shape[0]
+    metric_logger.update(loss=loss.item())
+    metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+
+    # update top 5 labels log if applicable
+    if classifier.module.num_labels >= 5:
+        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+
+    # # eval loop for input data image
+    # for inp in metric_logger.log_every(val_loader, print_freq, header):
+         
+    # output eval stats produced by the classifier
+    if len(data_classes) >= 5:
+        print(f'Top 1: [{metric_logger.acc1.global_avg:.3f}] Top 5: [{metric_logger.acc5.global_avg:.3f}] Loss: [{metric_logger.loss.global_avg:.3f}] Prediction: {prediction_cache} Target: {target_cache}')
+    else:
+        print(f'Top 1: [{metric_logger.acc1.global_avg:.3f}] Loss: [{metric_logger.loss.global_avg:.3f}] Prediction: {prediction_cache} Target: {target_cache}')
 
     # return eval stats
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, prediction, target, prediction_cache, target_cache
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, output, target, prediction_cache, target_cache
+
+
+class KCKLHead(nn.Module):
+    def __init__(self, in_dim, out_dim, use_bn=False, norm_last_layer=True, nlayers=3, hidden_dim=2048, bottleneck_dim=256, num_labels=11):
+
+        super().__init__()
+
+        self.linear_classifier = nn.Linear(out_dim, num_labels)
+        self.linear_loss = nn.CrossEntropyLoss()
+        
+        nlayers = max(nlayers, 1)
+
+        if nlayers == 1:
+            self.mlp = nn.Linear(in_dim, bottleneck_dim)
+        else:
+            layers = [nn.Linear(in_dim, hidden_dim)]
+            if use_bn:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.GELU())
+            for _ in range(nlayers - 2):
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+                if use_bn:
+                    layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(nn.GELU())
+            layers.append(nn.Linear(hidden_dim, bottleneck_dim))
+            self.mlp = nn.Sequential(*layers)
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.mlp = self.mlp.to(device)
+
+        self.apply(self._init_weights)
+        self.last_layer = nn.utils.weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
+        self.last_layer.weight_g.data.fill_(1)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.last_layer = self.last_layer.to(device)
+
+        if norm_last_layer:
+            self.last_layer.weight_g.requires_grad = False
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            utils.trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def linear_forward(self, h, y):
+        y_h_pred = self.linear_classifier(h)
+        loss_y_h = self.linear_loss(y_h_pred, y)
+        return loss_y_h
+
+    def forward(self, x):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        x = x.to(device)
+        x = self.mlp(x)
+        x = nn.functional.normalize(x, dim=-1, p=2)
+        x = self.last_layer(x)
+        return x
 
 
 class Network2D(nn.Module):
 
     # Initialize the network
     def __init__(self, linear_input_dim, num_labels):
+
+        self.linear_input_dim = linear_input_dim
+        self.num_labels = num_labels
         
         super(Network2D, self).__init__()
 
@@ -417,7 +451,6 @@ class Network2D(nn.Module):
 
     # The forward propagation algorithm
     def forward(self, x):
-
         x = x.view(x.shape[0], -1)
         x = self.linear(x)
         
@@ -428,12 +461,15 @@ class Network3D(nn.Module):
 
     # Initialize the network
     def __init__(self, input_dim, num_labels):
+
+        self.input_dim = input_dim
+        self.num_labels = num_labels
         
         super(Network3D, self).__init__()
 
-        self.conv1 = nn.Conv2d(6, 12, 3)
+        self.conv1 = nn.Conv2d(1, 8, 3)
         self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(12, 16, 3)
+        self.conv2 = nn.Conv2d(8, 16, 3)
 
         self.fc1 = nn.Linear(input_dim, 256)
         self.fc2 = nn.Linear(256, 128)
@@ -455,36 +491,3 @@ class Network3D(nn.Module):
         x = self.fc3(x)
 
         return x
-
-
-class Network4D(nn.Module):
-
-    # Initialize the network
-    def __init__(self, raw_input_dim, num_labels):
-        
-        super(Network4D, self).__init__()
-
-        self.conv3d1 = nn.Conv3d(3, 16, 3)
-        self.pool = nn.MaxPool2d(2, 2)
-
-        self.fc1 = nn.Linear(raw_input_dim, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, num_labels)
-
-    # The forward propagation algorithm
-    def forward(self, x):
-
-        x = self.pool(F.relu(self.conv3d1(x)))
-
-        dim1 = x.shape[1]
-        dim2 = x.shape[2]
-        dim3 = x.shape[3]
-
-        x = x.view(-1, 16 * dim1 * dim2 * dim3)
-
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-
-        return x
-    
