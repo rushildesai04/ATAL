@@ -299,10 +299,11 @@ class ATALHead(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
+        a = x.detach()
         x = self.mlp(x)
         x = nn.functional.normalize(x, dim=-1, p=2)
         x = self.last_layer(x)
-        return x
+        return x, a
     
 class ATALHeadClassify(nn.Module):
     def __init__(self, in_dim, out_dim, use_bn=False, norm_last_layer=True, nlayers=3, hidden_dim=2048, bottleneck_dim=256, num_labels=11):
@@ -343,24 +344,25 @@ class ATALHeadClassify(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def linear_forward(self, inp, tar):
-        tar = tar.float().requires_grad_(True).cuda()
+        tar = tar.cuda()
         inp = inp.requires_grad_(True).cuda()
         inp = self.linear_classifier(inp)
-        inp = torch.argmax(inp, dim=1).float()
         loss_y_h = self.linear_loss(inp, tar)
-        count = torch.sum(inp == tar).item()
-        return loss_y_h, count, inp
+        inp_max = torch.argmax(inp, dim=-1)
+        count = torch.sum(inp_max == tar).item()
+        return loss_y_h, count
 
     def forward(self, x, t):
+        a = x.detach()
         t_size = t.size(0)
         x = self.mlp(x)
         x = nn.functional.normalize(x, dim=-1, p=2)
         x = self.last_layer(x)
         y = x.detach()
         z = y[:t_size, :]
-        loss, count, pred = self.linear_forward(z, t)
+        loss, count = self.linear_forward(z, t)
         loss.backward(retain_graph=True)
-        return x, loss, count, pred
+        return x, loss, count, a
 
 # This code defines a PyTorch-based implementation of the Vision Transformer (ViT) model, specifically tailored for use with the 
 # DINO (Data-Efficient Image Transformer) framework. It also includes related utility functions. Let's break down the code step 

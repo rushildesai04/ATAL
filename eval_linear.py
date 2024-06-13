@@ -100,10 +100,7 @@ def eval_linear(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
 
     # wandb.init(
-    #     # set the wandb project where this run will be logged
-    #     project="dino_classifier",
-        
-    #     # track hyperparameters and run metadata
+    #     project="DINO-Classifier",
     #     config={
     #     "learning_rate": scheduler,
     #     "architecture": "DINO Linear Classifier",
@@ -134,11 +131,11 @@ def eval_linear(args):
         
         if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
             test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
+            # wandb.log({"test_loss": test_stats["loss"], "test_acc1": test_stats["acc1"], "test_acc5": test_stats["acc5"]})
             print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             best_acc = max(best_acc, test_stats["acc1"])
             print(f'Max accuracy so far: {best_acc:.2f}%')
-            log_stats = {**{k: v for k, v in log_stats.items()},
-                         **{f'test_{k}': v for k, v in test_stats.items()}}
+            log_stats = {**{k: v for k, v in log_stats.items()}, **{f'test_{k}': v for k, v in test_stats.items()}}
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
@@ -150,6 +147,10 @@ def eval_linear(args):
                 "best_acc": best_acc,
             }
             torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
+        # wandb.log({'epoch_train_lr': log_stats["train_lr"], 'epoch_train_loss': log_stats["train_loss"], 
+        #            'epoch_train_acc1': log_stats["train_acc1"], 'epoch_train_acc5': log_stats["train_acc5"], 
+        #            'epoch_test_loss': log_stats["test_loss"], 'epoch_test_acc1': log_stats["test_acc1"], 
+        #            'epoch_test_acc5': log_stats["test_acc5"], 'epoch': log_stats["epoch"]})
     print("Training of the supervised linear classifier on frozen features completed.\n"
                 "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
     # wandb.finish()
@@ -187,14 +188,16 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
         # step
         optimizer.step()
 
+        # wandb.log({"lr": optimizer.param_groups[0]["lr"], "wd": optimizer.param_groups[0]["weight_decay"], "mm": optimizer.param_groups[0]["momentum"]})
+
         if linear_classifier.module.num_labels >= 5:
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
-            # wandb.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "acc1": acc1, "acc5": acc5})
+            # wandb.log({"train_loss": loss.item(), "train_acc1": acc1, "train_acc5": acc5})
             metric_logger.meters['acc1'].update(acc1.item(), n=args.batch_size_per_gpu)
             metric_logger.meters['acc5'].update(acc5.item(), n=args.batch_size_per_gpu)
         else:
             acc1, = utils.accuracy(output, target, topk=(1,))
-            # wandb.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "acc1": acc1})
+            # wandb.log({"train_loss": loss.item(), "train_acc1": acc1})
             metric_logger.meters['acc1'].update(acc1.item(), n=len(loader))
 
         # log 

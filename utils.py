@@ -188,17 +188,31 @@ def restart_from_checkpoint(ckp_path, run_variables=None, **kwargs):
                 run_variables[var_name] = checkpoint[var_name]
 
 
-def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epochs=0, start_warmup_value=0):
+def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epochs=0, start_warmup_value=0, sch=None):
     warmup_schedule = np.array([])
-    warmup_iters = warmup_epochs * niter_per_ep
+
+    if sch is not None:
+        warmup_iters = 0
+        for it in range(warmup_epochs):
+            warmup_epochs = warmup_epochs + (niter_per_ep * sch(it))
+    else:
+        warmup_iters = warmup_epochs * niter_per_ep
+
     if warmup_epochs > 0:
         warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
 
-    iters = np.arange(epochs * niter_per_ep - warmup_iters)
+    if sch is not None:
+        total_iters = 0
+        for it in range(epochs):
+            total_iters = total_iters + (niter_per_ep * sch(it))
+        iters = np.arange(total_iters - warmup_iters)
+    else:
+        iters = np.arange(epochs * niter_per_ep - warmup_iters)
+
     schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
 
     schedule = np.concatenate((warmup_schedule, schedule))
-    assert len(schedule) == epochs * niter_per_ep
+    # assert len(schedule) == epochs * niter_per_ep
     return schedule
 
 
@@ -481,7 +495,6 @@ def init_distributed_mode(args):
     # launched naively with `python main_dino.py`
     # we manually add MASTER_ADDR and MASTER_PORT to env variables
     elif torch.cuda.is_available():
-        print('Will run the code on one GPU.')
         args.rank, args.gpu, args.world_size = 0, 0, 1
         os.environ['MASTER_ADDR'] = '127.0.0.1'
         os.environ['MASTER_PORT'] = '29500'
@@ -497,8 +510,7 @@ def init_distributed_mode(args):
     )
 
     torch.cuda.set_device(args.gpu)
-    print('Distributed Init (Rank {}) Path: {}'.format(
-        args.rank, args.dist_url), flush=True)
+    print(f'Distributed Training [Rank {args.rank}] [Size: {args.world_size}] [Path: {args.dist_url}]')
     dist.barrier()
     setup_for_distributed(args.rank == 0)
 
@@ -611,7 +623,7 @@ class MultiCropWrapper(nn.Module):
         self.backbone = backbone
         self.head = head
 
-    def forward(self, x, t):
+    def forward(self, x):
         # convert to list
         if not isinstance(x, list):
             x = [x]
@@ -630,7 +642,7 @@ class MultiCropWrapper(nn.Module):
             output = torch.cat((output, _out))
             start_idx = end_idx
         # Run the head forward on the concatenated features.
-        return self.head(output, t)
+        return self.head(output)
 
 
 def get_params_groups(model):
